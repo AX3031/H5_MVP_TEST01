@@ -1,0 +1,13 @@
+
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 运行时数据（SQLite 数据库、截图等）
+data/
+pip_install.log
+
+# IDE
+.idea/

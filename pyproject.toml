@@ -1,0 +1,16 @@
+[project]
+name = "project4"
+version = "0.1.0"
+description = "待办协同 H5（FastAPI + SQLAlchemy async + transitions）"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "pydantic-settings>=2.4",
+    "PyJWT>=2.9",
+    "bcrypt>=4.2",
+    "transitions>=0.9",
+    "apscheduler>=3.10",
+]

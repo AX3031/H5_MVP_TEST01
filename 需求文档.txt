@@ -1,0 +1,247 @@
+**关于 Redis 的决策，先给结论：MVP 阶段不要装 Redis，用你已有的 PostgreSQL 替代。** 你的待办协同应用在起步阶段的缓存、消息通知和后台任务负载，PostgreSQL 内置的能力足以覆盖，额外维护一个 Redis 实例带来的运维负担大于收益。具体替代路径放在架构文档的“Redis 替代方案”一节展开。
+
+下面是一份可以直接作为开发依据的 **产品需求与架构文档（MVP 版）**。
+
+
+# 待办协同 H5 · 产品需求与架构文档（v0.1 MVP）
+
+
+## 1. 产品概述
+
+### 1.1 定位
+
+一款**移动端优先的待办协同工具**。用户创建待办后，可将其指派、转交给组织内其他成员，接收方在 H5 中处理并推进状态。MVP 阶段只做**手动创建 + 人与人之间的流转**，不接入第三方，不引入审批语义。
+
+### 1.2 MVP 范围
+
+| 包含 | 不包含（后续版本） |
+|---|---|
+| 注册 / 登录 / 登出 | 第三方登录（OAuth） |
+| 创建待办（标题、描述、负责人、截止日期） | 第三方系统自动生成待办 |
+| 待办状态机流转（指派、开始、完成、转交、驳回） | BPMN / 审批流引擎 |
+| 流转历史审计 | 会签、加签、条件分支 |
+| H5 列表 / 详情 / 操作 | 复杂 RBAC（先做“本人 / 同组织”两级） |
+| 站内通知（轮询或轻量推送） | 短信 / 邮件 / Push 推送 |
+
+
+## 2. 状态机设计（Place-Transition）
+
+### 2.1 状态定义
+
+```
+pending（待处理）  ──assign──▶  in_progress（进行中）  ──complete──▶  completed（已完成）
+     │                              │
+     │reject                        │transfer
+     ▼                              ▼
+  rejected（已驳回）            pending（回到待处理，负责人变更）
+```
+
+| 状态 | 含义 | 进入条件 |
+|---|---|---|
+| `pending` | 待办已创建/已转交，等待当前负责人开始处理 | 创建待办时默认；转交或驳回后回到此状态 |
+| `in_progress` | 负责人已确认开始处理 | 从 `pending` 执行 `assign`（确认接收） |
+| `completed` | 处理完毕 | 从 `in_progress` 执行 `complete` |
+| `rejected` | 负责人拒绝接收该待办 | 从 `pending` 执行 `reject`，需填写原因 |
+
+**转交（transfer）** 从 `in_progress` 发起时，语义是“当前负责人将处理责任永久移交给另一人”，`assignee_id` 变更，状态回到 `pending`；从 `pending` 也可以转交（相当于改派）。
+
+### 2.2 允许的转换表
+
+| 当前状态 | 动作 | 目标状态 | 执行角色 | 必填字段 |
+|---|---|---|---|---|
+| — | `create` | `pending` | 创建者 | title, assignee_id |
+| `pending` | `assign` | `in_progress` | 当前 assignee | — |
+| `pending` | `reject` | `rejected` | 当前 assignee | reject_reason |
+| `pending` | `transfer` | `pending` | 当前 assignee 或创建者 | new_assignee_id |
+| `in_progress` | `complete` | `completed` | 当前 assignee | — |
+| `in_progress` | `transfer` | `pending` | 当前 assignee | new_assignee_id |
+
+**非法转换一律在服务端拒绝**，返回 `409 Conflict`，不依赖前端按钮显隐来“假装”限制。
+
+### 2.3 Python 实现选型
+
+推荐使用 **`transitions`** 库（`pytransitions/transitions`），它是 Python 生态中成熟的有限状态机实现，支持条件（`conditions`）和回调（`on_enter` / `after`），可以直接嵌入 FastAPI 的领域层。相比引入工作流引擎，`transitions` 的侵入性极低：你只需要在 `Todo` 领域对象或一个独立的 `TodoFSM` 类上定义状态和转换，FastAPI 路由层调用 `trigger` 并捕获 `MachineError` 即可。
+
+如果团队不想引入第三方库，**手写一个字典驱动的转换表**同样可行（状态数只有 4 个，转换规则不超过 8 条），但建议至少在领域层把“当前状态 + 动作 → 是否合法”封装成一个函数，而不是散落在路由里做 `if/else`。
+
+
+## 3. 技术架构
+
+### 3.1 技术栈确认
+
+| 层 | 选型 | 说明 |
+|---|---|---|
+| 前端 | **uni-app（Vue 3 + Composition API）** | 一套代码覆盖 H5，保留向小程序/App 扩展的路径 |
+| 前端状态 | **Pinia**（uni-app 内置，使用 `@dcloudio/pinia`） | 管理登录态、当前用户、待办列表缓存 |
+| 前端路由拦截 | **`uni.addInterceptor`**（H5/App 有效）+ 封装 `safeNavigateTo` | 未登录跳转登录页，登录后回跳 |
+| 后端 | **FastAPI**（Python 3.12+） | 异步优先，自动 OpenAPI |
+| ORM / 驱动 | **SQLAlchemy 2.x async + `asyncpg`** | `postgresql+asyncpg://`，`expire_on_commit=False` |
+| 数据库 | **PostgreSQL**（已有） | 同时承担缓存、通知信号、后台任务队列的角色（见第 5 节） |
+| 状态机 | **`transitions`** | 领域层校验，服务端强制执行 |
+| 后台任务 | **APScheduler（`AsyncIOScheduler`），运行在 FastAPI 进程内** | 逾期扫描、待办提醒；低流量场景不需要 Celery / Redis |
+| 密码哈希 | `bcrypt` 或 `argon2-cffi` | 不存明文 |
+| 认证 | **JWT（Access + Refresh）** | Access 短效（15 min），Refresh 存 `httpOnly` cookie |
+
+
+### 3.2 项目结构（建议）
+
+```
+todo-h5/
+├── frontend/                          # uni-app 项目
+│   ├── src/
+│   │   ├── stores/                   # Pinia
+│   │   │   ├── auth.ts               # 登录态、token 刷新
+│   │   │   └── todo.ts              # 待办列表、当前详情
+│   │   ├── pages/
+│   │   │   ├── login/
+│   │   │   ├── todo-list/
+│   │   │   └── todo-detail/
+│   │   ├── api/                      # request 封装（自动带 token，401 刷新）
+│   │   ├── utils/
+│   │   │   └── navigate.ts           # safeNavigateTo + 登录拦截
+│   │   └── App.vue
+│   └── ...
+│
+└── backend/
+    ├── app/
+    │   ├── main.py                   # FastAPI app + lifespan（启动 scheduler）
+    │   ├── config.py                 # pydantic-settings
+    │   ├── db.py                     # async engine / session
+    │   ├── models/                   # SQLAlchemy models
+    │   ├── schemas/                  # Pydantic v2 request/response
+    │   ├── routers/
+    │   │   ├── auth.py
+    │   │   └── todos.py
+    │   ├── domain/
+    │   │   └── todo_fsm.py           # transitions Machine 定义
+    │   └── services/
+    │       ├── todo_service.py       # 创建、流转、权限校验
+    │       └── scheduler.py          # 逾期扫描 job
+    ├── alembic/
+    └── pyproject.toml
+```
+
+
+## 4. 数据模型（MVP）
+
+以下为建议的**最小表结构**，使用 PostgreSQL 原生类型。
+
+### 4.1 `users`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | `UUID PK` | `gen_random_uuid()` |
+| `email` | `TEXT UNIQUE NOT NULL` | 登录标识 |
+| `password_hash` | `TEXT NOT NULL` | bcrypt / argon2 |
+| `display_name` | `TEXT` | 显示名 |
+| `org_id` | `UUID NOT NULL` | **组织隔离的关键字段**，所有待办查询默认按此过滤 |
+| `created_at` | `TIMESTAMPTZ` | |
+
+### 4.2 `todos`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | `UUID PK` | |
+| `org_id` | `UUID NOT NULL` | 与 `users.org_id` 对齐，索引 |
+| `title` | `TEXT NOT NULL` | |
+| `description` | `TEXT` | |
+| `status` | `TEXT NOT NULL` | `pending / in_progress / completed / rejected`，`CHECK` 约束 |
+| `assignee_id` | `UUID NOT NULL` | 当前负责人，`REFERENCES users(id)` |
+| `creator_id` | `UUID NOT NULL` | 创建者 |
+| `due_date` | `TIMESTAMPTZ` | 可空 |
+| `reject_reason` | `TEXT` | `rejected` 时必填，可在服务端条件校验 |
+| `created_at` / `updated_at` | `TIMESTAMPTZ` | |
+
+**索引**：`(org_id, assignee_id, status)` 覆盖“我的待办”高频查询；`(due_date) WHERE status NOT IN ('completed','rejected')` 用于逾期扫描。
+
+### 4.3 `todo_transitions`（流转审计，不可省略）
+
+| 字段 | 类型 |
+|---|---|
+| `id` | `BIGSERIAL PK` |
+| `todo_id` | `UUID REFERENCES todos(id)` |
+| `from_status` | `TEXT`（首次为 `NULL`） |
+| `to_status` | `TEXT` |
+| `action` | `TEXT`（`create / assign / transfer / complete / reject`） |
+| `operator_id` | `UUID` |
+| `meta` | `JSONB`（如 `{"new_assignee_id": "..."}`） |
+| `created_at` | `TIMESTAMPTZ` |
+
+**原则：`todos.status` 的每一次变更，必须与一条 `todo_transitions` 插入在同一数据库事务中提交。** 这是后续做审计、回溯和“谁在什么时候把待办转给了谁”的唯一可靠来源。
+
+
+## 5. Redis 替代方案（你不需要安装 Redis）
+
+你的场景在 MVP 阶段对 Redis 的三类典型用途，PostgreSQL 都有可落地的替代：
+
+### 5.1 实时通知 → PostgreSQL `LISTEN / NOTIFY`
+
+当待办被指派或转交时，服务端在执行流转的同一事务中，向 `todo_events` 频道 `NOTIFY` 一条 JSON 消息。FastAPI 启动时建立一条专用的 `asyncpg` 长连接执行 `LISTEN todo_events`，收到通知后通过 WebSocket 或 SSE 推送给对应用户。
+
+关键约束：`LISTEN/NOTIFY` 是**瞬时信号**，如果接收方不在线，通知会丢失。因此 **WebSocket 推送只作为“在线加速”，站内通知必须落库**（见 5.3），用户下次打开时拉取未读。
+
+### 5.2 后台任务 / 逾期扫描 → APScheduler + `SKIP LOCKED`
+
+逾期扫描本身不是高并发场景：每 5 分钟扫描一次 `due_date < now()` 且未完成的待办，直接在 FastAPI 进程内用 `AsyncIOScheduler` 执行即可，不需要 Celery 或 Redis。
+
+如果后续出现需要“多 worker 竞争消费”的后台任务，再引入一张 `jobs` 表 + `SELECT ... FOR UPDATE SKIP LOCKED` 即可，同样不依赖 Redis。MVP 阶段连这张表都不需要。
+
+### 5.3 未读计数 / 会话状态 → 直接查 PostgreSQL
+
+“我的待办数量”“未读通知数”这类计数，在数据量达到万级以上之前，一条带索引的 `COUNT(*)` 完全够用。**不要为了“看起来有缓存”而引入 Redis**——你当前的瓶颈不在数据库查询，而在先把流转闭环跑通。
+
+**结论：MVP 阶段额外安装 Redis 的收益接近于零，运维成本（进程管理、持久化配置、连接池调优）却是实打实的。等到单实例 APScheduler 开始漏任务、`LISTEN` 连接数成为瓶颈、或缓存命中率被实际数据证明有必要时，再引入 Redis 不迟。**
+
+
+## 6. API 设计要点
+
+### 6.1 认证
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/v1/auth/register` | 邮箱 + 密码 + org_id（首次可自动创建组织） |
+| `POST` | `/api/v1/auth/login` | 返回 `access_token`（body），`refresh_token` 写入 `httpOnly` cookie |
+| `POST` | `/api/v1/auth/refresh` | 从 cookie 读 refresh，轮换后返回新 access |
+| `POST` | `/api/v1/auth/logout` | 撤销 refresh，清除 cookie |
+
+Access Token 通过 `Authorization: Bearer` 头传递。**不要在 `localStorage` 中存 access token**；uni-app 的 H5 环境下 `uni.setStorageSync` 底层写的是 `localStorage`，同样不适合存敏感凭证。登录态在 Pinia 中维护，access token 仅存内存（刷新页面后通过 `/auth/refresh` 恢复会话）。
+
+### 6.2 待办
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/v1/todos` | 创建，默认 `pending`，创建时即写一条 `create` 流转记录 |
+| `GET` | `/api/v1/todos?scope=mine` | “我的待办”：`assignee_id = current_user AND org_id = current_org` |
+| `GET` | `/api/v1/todos/{id}` | 详情，返回当前用户**可执行的动作列表**（`available_actions`） |
+| `POST` | `/api/v1/todos/{id}/transition` | 统一流转入口，body 含 `action` 及动作所需字段 |
+
+**关于 `available_actions`**：服务端根据 `todo.status`、当前用户是否为 `assignee`、是否为 `creator`，计算并返回该用户可执行的动作数组（如 `["assign", "reject", "transfer"]`）。前端直接渲染，不做自己的权限判断。权限校验的**唯一真相源在服务端**。
+
+
+## 7. 前端 H5 要点
+
+### 7.1 登录拦截
+
+uni-app 的 H5 端使用 `uni.addInterceptor` 拦截 `navigateTo`、`redirectTo`、`switchTab`，在跳转前检查 Pinia `auth` store 中的登录态；未登录则跳转登录页并携带 `redirect` 参数，登录后回跳。封装一个 `safeNavigateTo` 作为统一出口，避免散落的直接调用绕过拦截。
+
+### 7.2 列表页与详情页的交互约定
+
+列表页只返回“我的待办”摘要（title、status、due_date、assignee 显示名）。详情页加载时一次性拿到待办数据 + `available_actions` + 流转历史（可选分页）。操作按钮完全由 `available_actions` 驱动，前端不硬编码“什么状态显示什么按钮”。
+
+### 7.3 Token 刷新策略
+
+`request` 封装层拦截 `401`：调用 `/auth/refresh` 换取新 access token 后**重放原请求**；如果 refresh 也失败（过期或已被撤销），清除 Pinia 登录态并跳转登录页。并发请求同时 401 时，用一个 Promise 锁保证只发起一次 refresh。
+
+
+## 8. 演进路线（MVP 之后）
+
+| 优先级 | 方向 | 触发条件 |
+|---|---|---|
+| P0 | 接入第三方自动创建待办 | 开放 `POST /api/v1/todos` + API Key + `source + external_id` 幂等键 |
+| P1 | 引入 `arq` 或 Celery + Redis | 当单实例 APScheduler 漏任务、或后台任务需要横向扩展时，再将 Redis 引入作为 broker |
+| P2 | BPMN 审批能力 | 出现“会签、条件分支、多级审批”需求时，再评估轻量引擎，`todos` 表增加 `process_instance_id` |
+| P3 | 消息 Push / 邮件 | H5 内站内信无法触达离线用户时 |
+
+---
+
+**总结**：这份 MVP 的核心决策是 **“PostgreSQL 单库支撑全部基础设施需求”**——状态机用 `transitions` 在领域层强制校验，通知用 `LISTEN/NOTIFY` 做在线加速、落库做离线兜底，逾期扫描用进程内 APScheduler，前端用 Pinia + 路由拦截 + `available_actions` 驱动 UI。Redis 的引入被推迟到有**实际数据**证明单库方案不够用的时刻，而不是现在。
